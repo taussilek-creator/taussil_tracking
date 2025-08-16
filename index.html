@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <title>Fahrer Verfolgung</title>
+
+  <!-- Firebase v8 -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+
+  <style>
+    body{font-family:system-ui,-apple-system,Arial;margin:0}
+    #map{height:60vh;width:100%;background:#eee}
+    .panel{padding:12px}
+    .pill{padding:6px 10px;border:1px solid #ddd;border-radius:8px;margin:4px;display:inline-block}
+    .eta{font-weight:700}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <div class="pill">Fahrt: <span id="distance">—</span></div>
+    <div class="pill eta">Ankunftszeit: <span id="countdown">—</span></div>
+  </div>
+
+  <!-- الأصوات -->
+  <audio id="soundAccept" src="unterwegs.mp3" preload="auto"></audio>
+  <audio id="soundOneMinute" src="angekommen.mp3" preload="auto"></audio>
+
+  <script>
+    /* ================= Firebase ================= */
+    var firebaseConfig = {
+      apiKey: "AIzaSyCUiy2nF3V_Z4V3k0MbfyRGuGoBBp6uACE",
+      authDomain: "taussil-tracking.firebaseapp.com",
+      databaseURL: "https://taussil-tracking-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId: "taussil-tracking",
+      storageBucket: "taussil-tracking.firebasestorage.app",
+      messagingSenderId: "733589615357",
+      appId: "1:733589615357:web:1926206637b7af263ac494"
+    };
+    firebase.initializeApp(firebaseConfig);
+    var db = firebase.database();
+
+    /* ================= Helpers ================= */
+    function parseLatLng(str){
+      if(!str) return null;
+      var p = String(str).split(",");
+      if(p.length!==2) return null;
+      var lat = parseFloat(p[0].trim());
+      var lng = parseFloat(p[1].trim());
+      if(isNaN(lat)||isNaN(lng)) return null;
+      return {lat:lat, lng:lng};
+    }
+    function normalizeStatus(s){
+      if(!s) return "";
+      s = String(s).trim().toLowerCase();
+      if(s==="bearbeitung" || s==="processing" || s==="pending") return "bearbeitung";
+      if(s==="unterwegs" || s==="accepted" || s==="on the way" || s==="on_the_way") return "unterwegs";
+      return s;
+    }
+
+    /* ================= صوت تلقائي + fallback للتفاعل الأول ================= */
+    var audioArmed = false;
+    function tryPlay(id){
+      var el = document.getElementById(id);
+      if(!el) return Promise.resolve();
+      el.currentTime = 0;
+      return el.play();
+    }
+    function autoSound(id){
+      tryPlay(id).catch(function(){
+        if (audioArmed) return;
+        audioArmed = true;
+        var once = function(){
+          tryPlay(id).catch(()=>{});
+          window.removeEventListener('pointerdown', once);
+          window.removeEventListener('keydown', once);
+          window.removeEventListener('touchstart', once);
+        };
+        window.addEventListener('pointerdown', once, {once:true});
+        window.addEventListener('keydown', once, {once:true});
+        window.addEventListener('touchstart', once, {once:true, passive:true});
+      });
+    }
+
+    /* ================= UI refs ================= */
+    var distanceEl, countdownEl;
+
+    /* ================= Map / Route ================= */
+    var map, driverMarker, destMarker, fitOnce=false;
+    var directionsService, directionsRenderer;
+
+    /* ================= Countdown & Status (هدف وصول محفوظ) ================= */
+    var countdownTimer=null, remaining=null, oneMinuteWarned=false;
+    var prevStatusNorm=null, deliveryActive=false;
+    var EXTRA_SECONDS = 180; // +3 دقائق
+    var serverOffsetMs = 0;
+    var etaTargetMs = null;
+    var orderId = null;
+
+    // تصحيح وقت العميل بوقت السيرفر
+    db.ref(".info/serverTimeOffset").on("value", function(snap){
+      var v = snap.val();
+      serverOffsetMs = (typeof v === "number") ? v : 0;
+    });
+    function nowServerMs(){ return Date.now() + serverOffsetMs; }
+
+    // تخزين/استرجاع الهدف محليًا لكل orderId
+    function storageKey(){ return "etaTarget_"+orderId; }
+    function saveEtaTarget(ms){
+      etaTargetMs = ms;
+      try{ localStorage.setItem(storageKey(), String(ms)); }catch(e){}
+    }
+    function loadEtaTarget(){
+      try{
+        var v = localStorage.getItem(storageKey());
+        if(v){ etaTargetMs = parseInt(v,10); if(isNaN(etaTargetMs)) etaTargetMs = null; }
+      }catch(e){}
+    }
+    function clearEtaTarget(){
+      etaTargetMs = null;
+      try{ localStorage.removeItem(storageKey()); }catch(e){}
+    }
+
+    function resetCountdownUI(){
+      if(countdownTimer){ clearInterval(countdownTimer); countdownTimer=null; }
+      remaining=null; oneMinuteWarned=false;
+      etaTargetMs=null; clearEtaTarget();
+      if(countdownEl) countdownEl.textContent="—";
+    }
+
+    // حساب هدف الوصول من بيانات السيرفر (يفضّل استخدام Arrival_Timestamp)
+    function serverEtaMsFromSnapshot(v){
+      // 1) Arrival_Timestamp (ms أو s أو ISO)
+      if(v && v.Arrival_Timestamp != null){
+        if(typeof v.Arrival_Timestamp === 'number'){
+          var n = v.Arrival_Timestamp;
+          var ms = (n > 1e12) ? n : n*1000; // لو بالثواني حوّل لميلّي
+          return ms + EXTRA_SECONDS*1000;   // أضف +3 دقائق مرة واحدة
+        }
+        if(typeof v.Arrival_Timestamp === 'string'){
+          var t = Date.parse(v.Arrival_Timestamp);
+          if(!isNaN(t)) return t + EXTRA_SECONDS*1000;
+        }
+      }
+      // 2) أنكانفت/مدة خامة بالثواني (fallback أضعف دقة لأننا لا نعرف وقت القياس)
+      if(v && typeof v.Ankunft_Seconds_Raw === 'number'){
+        return nowServerMs() + (v.Ankunft_Seconds_Raw + EXTRA_SECONDS)*1000;
+      }
+      // 3) DurationValue (الأضعف)
+      if(v && typeof v.DurationValue === 'number'){
+        return nowServerMs() + (v.DurationValue + EXTRA_SECONDS)*1000;
+      }
+      return null;
+    }
+
+    // سياسة عدم-الزيادة: لا نسمح بزيادة الهدف بعد الحفظ، نسمح فقط بالتحسّن (>15s أبكر)
+    var ETA_IMPROVE_THRESHOLD_MS = 15000; // 15 ثانية
+    function updateEtaNoIncrease(newEtaMs){
+      if(newEtaMs == null) return;
+      if(etaTargetMs == null){
+        saveEtaTarget(newEtaMs);
+        startOrUpdateCountdownFromTarget();
+        return;
+      }
+      var diff = newEtaMs - etaTargetMs; // موجب = تأخير، سالب = تحسّن
+      if(diff < -ETA_IMPROVE_THRESHOLD_MS){
+        // تحسّن واضح: نحدّث للأسوأ؟ لا، للأسَرع (newEtaMs أبكر)
+        saveEtaTarget(newEtaMs);
+        startOrUpdateCountdownFromTarget();
+      }
+      // إن كان diff >= -15s لا نغيّر (وبالتالي لا يزيد بعد الريلود)
+    }
+
+    function startOrUpdateCountdownFromTarget(){
+      if(!deliveryActive || !etaTargetMs) return;
+      if(countdownTimer) clearInterval(countdownTimer);
+
+      function tick(){
+        var rem = Math.floor((etaTargetMs - nowServerMs())/1000);
+        remaining = Math.max(0, rem);
+        if(remaining === 60 && !oneMinuteWarned){
+          oneMinuteWarned = true;
+          autoSound("soundOneMinute");
+        }
+        renderCountdown();
+        if(remaining <= 0){
+          clearInterval(countdownTimer); countdownTimer=null;
+        }
+      }
+      tick();
+      countdownTimer = setInterval(tick, 1000);
+    }
+
+    function renderCountdown(){
+      if(remaining==null){ countdownEl.textContent="—"; return; }
+      var m=Math.floor(remaining/60), s=remaining%60;
+      countdownEl.textContent = m + ":" + (s<10?("0"+s):s);
+    }
+
+    function routeIfNeeded(origin, destination){
+      if(!origin||!destination) return;
+      directionsService.route({
+        origin: origin, destination: destination, travelMode: 'DRIVING'
+      }, function(result, status){
+        if(status==='OK'){ directionsRenderer.setDirections(result); }
+      });
+    }
+
+    /* ================= initMap ================= */
+    function initMap(){
+      distanceEl  = document.getElementById("distance");
+      countdownEl = document.getElementById("countdown");
+
+      map = new google.maps.Map(document.getElementById("map"), { zoom:14, center:{lat:52.52, lng:13.40} });
+      directionsService = new google.maps.DirectionsService();
+      directionsRenderer = new google.maps.DirectionsRenderer({
+        suppressMarkers:true,
+        polylineOptions:{ strokeColor:"#4285F4", strokeOpacity:0.8, strokeWeight:2 }
+      });
+      directionsRenderer.setMap(map);
+
+      var params = new URLSearchParams(window.location.search);
+      orderId = params.get("orderId");
+      if(!orderId){ alert("⚠ لم يتم تمرير orderId في الرابط"); return; }
+
+      // استرجاع هدف سابق (إن وُجد) قبل الاشتراك
+      loadEtaTarget();
+
+      var ref = db.ref("orders/" + orderId);
+      ref.on("value", function(snap){
+        var v = snap.val();
+        if(!v) return;
+
+        if(v.DistanceText) distanceEl.textContent = v.DistanceText;
+
+        // الحالة
+        var cur = normalizeStatus(v.Status);
+        if(cur === "unterwegs" && prevStatusNorm !== "unterwegs"){
+          deliveryActive = true;
+
+          // 🔊 صوت القبول فورًا
+          autoSound("soundAccept");
+
+          // عند التحوّل لأول مرة:
+          var firstEta = serverEtaMsFromSnapshot(v);
+          if(etaTargetMs){
+            // كان لدينا هدف سابق (مثلاً بعد ريلود) — لا نزيده
+            updateEtaNoIncrease(firstEta);
+          }else{
+            // لا هدف محفوظ — استخدم أول قيمة
+            updateEtaNoIncrease(firstEta);
+          }
+          startOrUpdateCountdownFromTarget();
+
+        } else if(cur === "bearbeitung" && prevStatusNorm !== "bearbeitung"){
+          deliveryActive = false;
+          resetCountdownUI();
+        }
+        prevStatusNorm = cur;
+
+        // أثناء السير: نلتزم بعدم الزيادة — نسمح فقط بالتحسّن
+        if(deliveryActive){
+          var liveEta = serverEtaMsFromSnapshot(v);
+          updateEtaNoIncrease(liveEta);
+        }
+
+        // مواقع + رسم
+        var dest = parseLatLng(v.Destination);
+        var drv  = parseLatLng(v.DriverLocation);
+
+        if(dest){
+          if(!destMarker){
+            destMarker = new google.maps.Marker({
+              position: dest, map: map,
+              icon: { url: "7720549.png", scaledSize: new google.maps.Size(28,28), anchor: new google.maps.Point(14,28) },
+              title: "المطعم / الوجهة"
+            });
+          } else destMarker.setPosition(dest);
+        }
+        if(drv){
+          if(!driverMarker){
+            driverMarker = new google.maps.Marker({
+              position: drv, map: map,
+              icon: { url: "710491-200.png", scaledSize: new google.maps.Size(28,28), anchor: new google.maps.Point(14,28) },
+              title: "السائق"
+            });
+          } else driverMarker.setPosition(drv);
+          map.panTo(drv);
+        }
+        if(dest && drv){
+          if(!fitOnce){
+            var b=new google.maps.LatLngBounds(); b.extend(dest); b.extend(drv); map.fitBounds(b); fitOnce=true;
+          }
+          routeIfNeeded(drv, dest);
+        }
+      });
+    }
+    window.initMap = initMap;
+  </script>
+
+  <!-- Google Maps -->
+  <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDipzUmxEQmAjaDkn6xQ91ZhqnkPmgl-2o&loading=async&callback=initMap"></script>
+</body>
+</html>
