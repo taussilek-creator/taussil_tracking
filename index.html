@@ -2,7 +2,442 @@
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="utf-8" />
+  <title>Fahrer Verfolgung<<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
   <title>Fahrer Verfolgung</title>
+
+  <!-- Firebase v8 -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+
+  <style>
+    body{font-family:system-ui,-apple-system,Arial;margin:0;background:#fafafa}
+    /* (3)(7) الخريطة: إزاحة 15px للأسفل واليسار + زوايا 15px */
+    #map{
+      height:70vh; width:70%; background:#eee;
+      position:relative; border-radius:15px; overflow:hidden;
+      transform: translate(-15px,15px);
+    }
+
+    /* (4) زر نوع الخريطة فوق الخريطة */
+    .toolbar-overlay{
+      position:absolute; z-index:3; top:16px; left:24px; display:flex; gap:8px; pointer-events:auto;
+    }
+    .select{
+      padding:6px 10px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;
+      box-shadow:0 2px 6px rgba(0,0,0,.2);
+    }
+
+    .panel{padding:12px}
+    .pill{padding:6px 10px;border:1px solid #ddd;border-radius:8px;margin:4px;display:inline-flex;align-items:center;gap:6px}
+    .eta{font-weight:700}
+
+    /* (5) الحالة بجانب Ankunftszeit بدون إطار + GIF */
+    .statusInline{display:inline-flex;align-items:center;gap:8px;margin:4px 6px;padding:6px 0;vertical-align:middle}
+    #statusIcon{width:32px;height:32px;display:none}
+
+    /* (6) أخضر ≤ 6 دقائق + نبض ≤ 60 ثانية */
+    #etaPill.green { background:#e6f7ec; border-color:#b7e3c7; color:#116b2c; }
+    #etaPill.blink { animation: bl 1s linear infinite; }
+    @keyframes bl { 0%{opacity:1} 50%{opacity:.45} 100%{opacity:1} }
+
+    /* (8) لوجو الشركة (اختياري) */
+    .brandLogo{
+      position:absolute; z-index:2; width:96px; height:auto;
+      filter: drop-shadow(0 2px 4px rgba(0,0,0,.25));
+      user-select:none; pointer-events:none; display:none;
+    }
+    .brandLogo.tl{ top:14px; left:14px; }
+    .brandLogo.bl{ bottom:14px; left:14px; }
+  </style>
+</head>
+<body>
+  <div id="map">
+    <!-- (4) مبدّل نوع الخريطة (اختياري، آمن لو حُذف) -->
+    <div class="toolbar-overlay">
+      <select id="mapType" class="select" title="نوع الخريطة">
+        <option value="roadmap">Roadmap</option>
+        <option value="satellite">Satellite</option>
+        <option value="terrain">Terrain</option>
+        <option value="hybrid">Hybrid</option>
+      </select>
+    </div>
+    <!-- (8) شعار الشركة (اختياري) -->
+    <img id="brandLogo" class="brandLogo tl" alt="logo">
+  </div>
+
+  <div class="panel">
+    <div class="pill">Fahrt: <span id="distance">—</span></div>
+    <div id="etaPill" class="pill eta">Ankunftszeit: <span id="countdown">—</span></div>
+    <!-- (5) الحالة بنفس السطر بدون إطار -->
+    <div class="statusInline">
+      <img id="statusIcon" alt="status">
+      <span id="statusText">—</span>
+    </div>
+  </div>
+
+  <!-- الأصوات (كما هي) -->
+  <audio id="soundAccept" src="unterwegs.mp3" preload="auto"></audio>
+  <audio id="soundOneMinute" src="angekommen.mp3" preload="auto"></audio>
+
+  <script>
+    /* ================= Firebase ================= */
+    var firebaseConfig = {
+      apiKey: "AIzaSyCUiy2nF3V_Z4V3k0MbfyRGuGoBBp6uACE",
+      authDomain: "taussil-tracking.firebaseapp.com",
+      databaseURL: "https://taussil-tracking-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId: "taussil-tracking",
+      storageBucket: "taussil-tracking.firebasestorage.app",
+      messagingSenderId: "733589615357",
+      appId: "1:733589615357:web:1926206637b7af263ac494"
+    };
+    firebase.initializeApp(firebaseConfig);
+    var db = firebase.database();
+
+    /* ================= Helpers (منطقك) ================= */
+    function parseLatLng(str){
+      if(!str) return null;
+      var p = String(str).split(",");
+      if(p.length!==2) return null;
+      var lat = parseFloat(p[0].trim());
+      var lng = parseFloat(p[1].trim());
+      if(isNaN(lat)||isNaN(lng)) return null;
+      return {lat:lat, lng:lng};
+    }
+    function normalizeStatus(s){
+      if(!s) return "";
+      s = String(s).trim().toLowerCase();
+      if(s==="bearbeitung" || s==="processing" || s==="pending") return "bearbeitung";
+      if(s==="unterwegs" || s==="accepted" || s==="on the way" || s==="on_the_way") return "unterwegs";
+      if(s==="geliefert" || s==="delivered") return "geliefert";
+      return s;
+    }
+    function esc(s){ return String(s||'').replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+    /* ================= صوت تلقائي + fallback ================= */
+    var audioArmed = false;
+    function tryPlay(id){ var el=document.getElementById(id); if(!el) return Promise.resolve(); el.currentTime=0; return el.play(); }
+    function autoSound(id){
+      tryPlay(id).catch(function(){
+        if (audioArmed) return;
+        audioArmed = true;
+        var once = function(){ tryPlay(id).catch(()=>{}); window.removeEventListener('pointerdown', once); window.removeEventListener('keydown', once); window.removeEventListener('touchstart', once); };
+        window.addEventListener('pointerdown', once, {once:true});
+        window.addEventListener('keydown', once, {once:true});
+        window.addEventListener('touchstart', once, {once:true, passive:true});
+      });
+    }
+
+    /* ================= UI refs ================= */
+    var distanceEl, countdownEl, etaPillEl, statusTextEl, statusIconEl;
+
+    /* ================= Map / Route ================= */
+    var map, driverMarker, destMarker, fitOnce=false;
+    var directionsService, directionsRenderer;
+    var lastDriverPos=null, driverInfo=null, restInfo=null;
+
+    /* (1) ستايل خريطة أحادي + طرق رمادية + أسماء الشوارع */
+    var baseStyle = [
+      { elementType:"geometry", stylers:[{ color:"#f5f5f5" }] },
+      { elementType:"labels.icon", stylers:[{ visibility:"off" }] },
+      { featureType:"poi", stylers:[{ visibility:"off" }] },
+      { featureType:"transit", stylers:[{ visibility:"off" }] },
+      { featureType:"administrative", elementType:"labels", stylers:[{ visibility:"off" }] },
+      { featureType:"water", elementType:"geometry.fill", stylers:[{ color:"#d6e8ff" }] },
+      { featureType:"road", elementType:"geometry", stylers:[{ color:"#cfcfcf" }] },
+      { featureType:"road", elementType:"geometry.stroke", stylers:[{ color:"#b9b9b9" }] },
+      { featureType:"road", elementType:"labels.text.fill", stylers:[{ color:"#4a4a4a" }] },
+      { featureType:"road", elementType:"labels.text.stroke", stylers:[{ color:"#ffffff" }] }
+    ];
+
+    /* (9) سهم السائق + حركة انسيابية */
+    function makeArrowIcon(rotationDeg){
+      return {
+        path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+        scale: 5,
+        strokeWeight: 2,
+        strokeColor: "#1a73e8",
+        fillColor: "#1a73e8",
+        fillOpacity: 1,
+        rotation: rotationDeg || 0,
+        anchor: new google.maps.Point(0, 2)
+      };
+    }
+    function bearing(from, to){
+      var dLon=(to.lng-from.lng)*Math.PI/180, lat1=from.lat*Math.PI/180, lat2=to.lat*Math.PI/180;
+      var y=Math.sin(dLon)*Math.cos(lat2);
+      var x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(dLon);
+      var brng=Math.atan2(y,x)*180/Math.PI;
+      return (brng+360)%360;
+    }
+    function tween(a,b,t){ return a+(b-a)*t; }
+    function smoothMoveArrow(marker, from, to, ms=350){
+      if(!from){ marker.setPosition(to); marker.setIcon(makeArrowIcon()); return; }
+      var head=bearing(from,to); const t0=performance.now();
+      function step(now){
+        const k=Math.min(1,(now-t0)/ms);
+        const pos={lat:tween(from.lat,to.lat,k), lng:tween(from.lng,to.lng,k)};
+        marker.setPosition(pos); marker.setIcon(makeArrowIcon(head));
+        if(k<1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }
+
+    /* ================= Countdown & Status (كما هو) ================= */
+    var countdownTimer=null, remaining=null, oneMinuteWarned=false;
+    var prevStatusNorm=null, deliveryActive=false;
+    var EXTRA_SECONDS = 180;
+    var serverOffsetMs = 0;
+    var etaTargetMs = null;
+    var orderId = null;
+
+    db.ref(".info/serverTimeOffset").on("value", function(snap){
+      var v = snap.val(); serverOffsetMs = (typeof v === "number") ? v : 0;
+    });
+    function nowServerMs(){ return Date.now() + serverOffsetMs; }
+
+    function storageKey(){ return "etaTarget_"+orderId; }
+    function saveEtaTarget(ms){ etaTargetMs = ms; try{ localStorage.setItem(storageKey(), String(ms)); }catch(e){} }
+    function loadEtaTarget(){ try{ var v=localStorage.getItem(storageKey()); if(v){ etaTargetMs=parseInt(v,10); if(isNaN(etaTargetMs)) etaTargetMs=null; } }catch(e){} }
+    function clearEtaTarget(){ etaTargetMs=null; try{ localStorage.removeItem(storageKey()); }catch(e){} }
+
+    function resetCountdownUI(){
+      if(countdownTimer){ clearInterval(countdownTimer); countdownTimer=null; }
+      remaining=null; oneMinuteWarned=false; etaTargetMs=null; clearEtaTarget();
+      if(countdownEl) countdownEl.textContent="—";
+      if(etaPillEl){ etaPillEl.classList.remove('green'); etaPillEl.classList.remove('blink'); }
+    }
+
+    function serverEtaMsFromSnapshot(v){
+      if(v && v.Arrival_Timestamp != null){
+        if(typeof v.Arrival_Timestamp === 'number'){
+          var n=v.Arrival_Timestamp, ms=(n>1e12)?n:n*1000; return ms + EXTRA_SECONDS*1000;
+        }
+        if(typeof v.Arrival_Timestamp === 'string'){
+          var t=Date.parse(v.Arrival_Timestamp); if(!isNaN(t)) return t + EXTRA_SECONDS*1000;
+        }
+      }
+      if(v && typeof v.Ankunft_Seconds_Raw === 'number'){
+        return nowServerMs() + (v.Ankunft_Seconds_Raw + EXTRA_SECONDS)*1000;
+      }
+      if(v && typeof v.DurationValue === 'number'){
+        return nowServerMs() + (v.DurationValue + EXTRA_SECONDS)*1000;
+      }
+      return null;
+    }
+
+    var ETA_IMPROVE_THRESHOLD_MS = 15000;
+    function updateEtaNoIncrease(newEtaMs){
+      if(newEtaMs == null) return;
+      if(etaTargetMs == null){ saveEtaTarget(newEtaMs); startOrUpdateCountdownFromTarget(); return; }
+      var diff=newEtaMs-etaTargetMs;
+      if(diff < -ETA_IMPROVE_THRESHOLD_MS){ saveEtaTarget(newEtaMs); startOrUpdateCountdownFromTarget(); }
+    }
+
+    function startOrUpdateCountdownFromTarget(){
+      if(!deliveryActive || !etaTargetMs) return;
+      if(countdownTimer) clearInterval(countdownTimer);
+      function tick(){
+        var rem = Math.floor((etaTargetMs - nowServerMs())/1000);
+        remaining = Math.max(0, rem);
+        if(remaining <= 360) etaPillEl.classList.add('green'); else etaPillEl.classList.remove('green');
+        if(remaining <= 60){
+          if(!oneMinuteWarned){ oneMinuteWarned = true; autoSound("soundOneMinute"); }
+          etaPillEl.classList.add('blink');
+        } else { etaPillEl.classList.remove('blink'); }
+        renderCountdown();
+        if(remaining <= 0){ clearInterval(countdownTimer); countdownTimer=null; }
+      }
+      tick(); countdownTimer=setInterval(tick,1000);
+    }
+
+    function renderCountdown(){
+      if(remaining==null){ countdownEl.textContent="—"; return; }
+      var m=Math.floor(remaining/60), s=remaining%60;
+      countdownEl.textContent = m + ":" + (s<10?("0"+s):s);
+    }
+
+    function routeIfNeeded(origin, destination){
+      if(!origin||!destination) return;
+      directionsService.route({ origin, destination, travelMode:'DRIVING' }, function(result, status){
+        if(status==='OK'){ directionsRenderer.setDirections(result); }
+      });
+    }
+
+    /* (5) مسارات افتراضية لصور الحالة (بدّلها بملفاتك) */
+    var STATUS_GIFS = {
+      bearbeitung: "warten.gif",
+      unterwegs:   "ziel.gif",
+      geliefert:   "verifiziert.gif"
+    };
+
+    /* ================= initMap ================= */
+    function initMap(){
+      distanceEl  = document.getElementById("distance");
+      countdownEl = document.getElementById("countdown");
+      etaPillEl   = document.getElementById("etaPill");
+      statusTextEl= document.getElementById("statusText");
+      statusIconEl= document.getElementById("statusIcon");
+
+      /* خريطة بستايل أحادي + إلغاء الأزرار (2) + زر ملء الشاشة (11) */
+      map = new google.maps.Map(document.getElementById("map"), {
+        zoom:14, center:{lat:52.52, lng:13.40},
+        styles: baseStyle,
+        mapTypeControl:false,
+        streetViewControl:false,
+        fullscreenControl:true,
+        rotateControl:false,
+        scaleControl:true,
+        zoomControl:false
+      });
+
+      /* (4) مبدّل نوع الخريطة — آمن لو العنصر غير موجود */
+      var sel = document.getElementById('mapType');
+      if (sel) {
+        sel.addEventListener('change', function(){
+          map.setMapTypeId(this.value);
+          if (this.value === 'roadmap') { map.setOptions({styles: baseStyle}); }
+          else { map.setOptions({styles: null}); }
+        });
+        sel.value = 'roadmap';
+      }
+
+      directionsService = new google.maps.DirectionsService();
+      directionsRenderer = new google.maps.DirectionsRenderer({
+        suppressMarkers:true,
+        polylineOptions:{ strokeColor:"#4285F4", strokeOpacity:0.8, strokeWeight:2 }
+      });
+      directionsRenderer.setMap(map);
+
+      /* (8) اللوجو من باراميترات الرابط — آمن لو العنصر غير موجود */
+      var params = new URLSearchParams(window.location.search);
+      var logoEl = document.getElementById('brandLogo');
+      if (logoEl) {
+        var logoSrc = params.get('logo');
+        var logoPos = (params.get('logoPos')||'tl').toLowerCase(); // tl / bl
+        if (logoSrc) {
+          logoEl.src = logoSrc;
+          logoEl.classList.toggle('tl', logoPos!=='bl');
+          logoEl.classList.toggle('bl', logoPos==='bl');
+          logoEl.style.display = 'block';
+        }
+      }
+
+      /* ———— نفس منطقك للاشتراك بـ orderId ———— */
+      orderId = params.get("orderId");
+      if(!orderId){ alert("⚠ لم يتم تمرير orderId في الرابط"); return; }
+
+      // استرجاع هدف سابق (إن وُجد) قبل الاشتراك
+      loadEtaTarget();
+
+      var ref = db.ref("orders/" + orderId);
+      ref.on("value", function(snap){
+        var v = snap.val();
+        if(!v) return;
+
+        if(v.DistanceText) distanceEl.textContent = v.DistanceText;
+
+        // (5) الحالة + GIF (واجهة فقط)
+        var cur = normalizeStatus(v.Status);
+        if(cur === "bearbeitung"){
+          statusTextEl.textContent = "Bearbeitung";
+          statusIconEl.src = STATUS_GIFS.bearbeitung; statusIconEl.style.display="inline";
+        } else if(cur === "unterwegs"){
+          statusTextEl.textContent = "Unterwegs";
+          statusIconEl.src = STATUS_GIFS.unterwegs; statusIconEl.style.display="inline";
+          if(prevStatusNorm !== "unterwegs") autoSound("soundAccept");
+        } else if(cur === "geliefert"){
+          statusTextEl.textContent = "Geliefert";
+          statusIconEl.src = STATUS_GIFS.geliefert; statusIconEl.style.display="inline";
+        } else {
+          statusTextEl.textContent = cur || "—";
+          statusIconEl.style.display="none";
+        }
+
+        // ———— منطقك الأصلي للعدّاد ————
+        if(cur === "unterwegs" && prevStatusNorm !== "unterwegs"){
+          deliveryActive = true;
+          autoSound("soundAccept");
+          var firstEta = serverEtaMsFromSnapshot(v);
+          if(etaTargetMs){ updateEtaNoIncrease(firstEta); } else { updateEtaNoIncrease(firstEta); }
+          startOrUpdateCountdownFromTarget();
+
+        } else if(cur === "bearbeitung" && prevStatusNorm !== "bearbeitung"){
+          deliveryActive = false; resetCountdownUI();
+        }
+        prevStatusNorm = cur;
+
+        if(deliveryActive){
+          var liveEta = serverEtaMsFromSnapshot(v);
+          updateEtaNoIncrease(liveEta);
+        }
+
+        // مواقع + رسم
+        var dest = parseLatLng(v.Destination);
+        var drv  = parseLatLng(v.DriverLocation);
+
+        // (10) المطعم: اسم + صورة من الداتا عند hover
+        if(dest){
+          if(!destMarker){
+            destMarker = new google.maps.Marker({
+              position: dest, map: map,
+              icon: { url: "7720549.png", scaledSize: new google.maps.Size(28,28), anchor: new google.maps.Point(14,28) },
+              title: v.RestaurantName || "Restaurant"
+            });
+            restInfo = new google.maps.InfoWindow({content:""});
+            let to;
+            destMarker.addListener('mouseover', ()=>{
+              var restName = esc(v.RestaurantName || "Restaurant");
+              var restLogo = v.RestaurantLogo ? '<br><img src="'+esc(v.RestaurantLogo)+'" style="width:60px;height:60px;border-radius:8px;margin-top:6px">' : "";
+              restInfo.setContent('<div style="text-align:center"><strong>'+restName+'</strong>'+restLogo+'</div>');
+              restInfo.open(map, destMarker);
+            });
+            destMarker.addListener('mouseout', ()=>{ to && clearTimeout(to); to=setTimeout(()=>restInfo.close(), 150); });
+          } else destMarker.setPosition(dest);
+        }
+
+        // (9)(10) السائق: سهم بحركة سلسة + اسم فقط عند hover
+        if(drv){
+          if(!driverMarker){
+            driverMarker = new google.maps.Marker({
+              position: drv, map: map,
+              icon: makeArrowIcon(0),
+              title: v.DriverName || "Fahrer"
+            });
+            driverInfo = new google.maps.InfoWindow({content:""});
+            let to2;
+            driverMarker.addListener('mouseover', ()=>{
+              var drvName = esc(v.DriverName || "Fahrer");
+              driverInfo.setContent('<div><strong>'+drvName+'</strong></div>');
+              driverInfo.open(map, driverMarker);
+            });
+            driverMarker.addListener('mouseout', ()=>{ to2 && clearTimeout(to2); to2=setTimeout(()=>driverInfo.close(), 150); });
+            lastDriverPos = drv;
+          } else {
+            var from = lastDriverPos || driverMarker.getPosition().toJSON();
+            smoothMoveArrow(driverMarker, from, drv, 350);
+            lastDriverPos = drv;
+          }
+          map.panTo(lastDriverPos);
+        }
+
+        if(dest && drv){
+          if(!fitOnce){
+            var b=new google.maps.LatLngBounds(); b.extend(dest); b.extend(drv); map.fitBounds(b); fitOnce=true;
+          }
+          routeIfNeeded(drv, dest);
+        }
+      });
+    }
+    window.initMap = initMap;
+  </script>
+
+  <!-- Google Maps -->
+  <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDipzUmxEQmAjaDkn6xQ91ZhqnkPmgl-2o&loading=async&callback=initMap"></script>
+</body>
+</html>/title>
 
   <!-- Firebase v8 -->
   <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
@@ -304,4 +739,5 @@
 </body>
 
 </html>
+
 
